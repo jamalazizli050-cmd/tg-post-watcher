@@ -17,7 +17,6 @@ CHANNELS = [
     "potaeto505",
     "lighty_19871983",
     "supertsigan",
-    # "pentwoodraws",  # временно убрали, он ломает запуск
     "markofmeow",
     "oretvsebiya",
     "skisskefir",
@@ -32,6 +31,7 @@ CHANNELS = [
     "camaldocs",
 ]
 
+TARGET_TAG = "#cliqueart"
 MAX_TEXT_LENGTH = 100
 
 user_client = TelegramClient(StringSession(USER_SESSION), API_ID, API_HASH)
@@ -43,6 +43,12 @@ async def new_post_handler(event):
     chat = await event.get_chat()
     message = event.message
 
+    text = message.text or message.caption or ""
+
+    # Пропускаем пост, если нет нужного тега
+    if TARGET_TAG.lower() not in text.lower():
+        return
+
     channel_name = getattr(chat, "title", "Unknown channel")
     username = getattr(chat, "username", None)
 
@@ -51,19 +57,20 @@ async def new_post_handler(event):
     else:
         link = "Приватный канал — публичной ссылки нет"
 
-    text = message.text or message.caption or "Новый пост без текста"
+    if not text.strip():
+        text = "Новый пост без текста"
 
     if len(text) > MAX_TEXT_LENGTH:
         text = text[:MAX_TEXT_LENGTH] + "\n\n...текст обрезан"
 
-    post_text = f"📢 Новый пост из: {channel_name}\n\n{text}\n\n🔗 {link}"
+    post_text = f"🎨 Найден арт из: {channel_name}\n\n{text}\n\n🔗 {link}"
 
     await bot_client.send_message(YOUR_ID, post_text)
 
 
 async def main():
     await user_client.start()
-    print("Бот запущен через USER_SESSION. Ждём новые посты...")
+    print("Бот запущен. Собираем только посты с #cliqueart...")
     await user_client.run_until_disconnected()
 
 
