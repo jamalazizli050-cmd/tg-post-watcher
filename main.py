@@ -5,7 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.sessions import StringSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -15,12 +15,6 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 USER_SESSION = os.getenv("USER_SESSION")
-
-WEEKLY_TARGET_IDS = [
-    int(user_id.strip())
-    for user_id in os.getenv("WEEKLY_TARGET_IDS", "").split(",")
-    if user_id.strip().isdigit()
-]
 
 CHANNELS = [
     "miLLLkaArts",
@@ -55,6 +49,25 @@ bot_client = TelegramClient("bot_session", API_ID, API_HASH).start(bot_token=BOT
 scheduler = AsyncIOScheduler(timezone=BAKU_TIMEZONE)
 
 
+def parse_target_ids(raw_value):
+    target_ids = []
+
+    for raw_id in raw_value.split(","):
+        raw_id = raw_id.strip()
+        if not raw_id:
+            continue
+
+        try:
+            target_ids.append(int(raw_id))
+        except ValueError:
+            print(f"Пропускаю некорректный WEEKLY_TARGET_IDS id: {raw_id}")
+
+    return target_ids
+
+
+WEEKLY_TARGET_IDS = parse_target_ids(os.getenv("WEEKLY_TARGET_IDS", ""))
+
+
 def load_subscribers():
     if not os.path.exists(SUBSCRIBERS_FILE):
         return set()
@@ -76,6 +89,21 @@ def save_subscriber(user_id):
         return True
 
     return False
+
+
+def remove_subscriber(user_id):
+    subscribers = load_subscribers()
+
+    if user_id not in subscribers:
+        return False
+
+    subscribers.remove(user_id)
+
+    with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as file:
+        for subscriber_id in sorted(subscribers):
+            file.write(f"{subscriber_id}\n")
+
+    return True
 
 
 def load_weekly_posts():
@@ -124,9 +152,31 @@ def build_post_data(chat, message, full_text):
 
     text_for_message = full_text.strip() or "Новый пост без текста"
     text_for_message = shorten_text(text_for_message, MAX_TEXT_LENGTH)
-    post_text = f"🎨 Найден арт из: {channel_name}\n\n{text_for_message}\n\n🔗 {link}"
+    post_text = (
+        f"🎨 {channel_name}\n"
+        f"━━━━━━━━━━━━\n\n"
+        f"{text_for_message}\n\n"
+        f"🔗 {link}"
+    )
 
     return channel_name, username, link, post_text
+
+
+def bot_menu_buttons():
+    return [
+        [Button.text("ℹ️ Help"), Button.text("🚫 Отписаться")],
+    ]
+
+
+def help_text():
+    return (
+        "🎨 #cliqueart watcher\n\n"
+        "Я присылаю новые посты с #cliqueart из отслеживаемых каналов.\n\n"
+        "/start — подписаться на обычные уведомления\n"
+        "/unsubscribe — отписаться от обычных уведомлений\n"
+        "/help — показать эту подсказку\n\n"
+        "Еженедельная сводка отправляется только в чаты из WEEKLY_TARGET_IDS в .env."
+    )
 
 
 async def send_post_notification(user_id, post_text, media_paths):
@@ -178,14 +228,16 @@ async def notify_subscribers(subscribers, post_text, media_messages):
 def build_weekly_summary(posts):
     if not posts:
         return (
-            "🎨 Еженедельная сводка артов\n\n"
+            "🎨 Weekly #cliqueart\n"
+            "━━━━━━━━━━━━\n\n"
             "За неделю было пусто."
         )
 
     lines = [
-        "🎨 Еженедельная сводка артов",
+        "🎨 Weekly #cliqueart",
+        "━━━━━━━━━━━━",
         "",
-        f"Всего постов: {len(posts)}",
+        f"Постов за неделю: {len(posts)}",
         "",
     ]
 
@@ -193,9 +245,9 @@ def build_weekly_summary(posts):
         text = post.get("text", "Без текста")
         text = shorten_text(text, 180)
 
-        lines.append(f"{index}. {post.get('channel_name', 'Unknown channel')}")
+        lines.append(f"{index}. 🎨 {post.get('channel_name', 'Unknown channel')}")
         lines.append(text)
-        lines.append(post.get("link", "Ссылки нет"))
+        lines.append(f"🔗 {post.get('link', 'Ссылки нет')}")
         lines.append("")
 
     return "\n".join(lines)
@@ -227,13 +279,45 @@ async def start_handler(event):
     if is_new:
         await event.reply(
             "✅ Ты подписался на #cliqueart уведомления.\n\n"
-            "Теперь я буду кидать сюда новые арты из отслеживаемых каналов."
+            "Теперь я буду кидать сюда новые арты из отслеживаемых каналов.",
+            buttons=bot_menu_buttons(),
         )
     else:
         await event.reply(
             "Ты уже подписан ✅\n\n"
-            "Ждём новые посты с #cliqueart."
+            "Ждём новые посты с #cliqueart.",
+            buttons=bot_menu_buttons(),
         )
+
+
+@bot_client.on(events.NewMessage(pattern="/help"))
+async def help_handler(event):
+    await event.reply(help_text(), buttons=bot_menu_buttons())
+
+
+@bot_client.on(events.NewMessage(pattern="/unsubscribe"))
+async def unsubscribe_handler(event):
+    if remove_subscriber(event.sender_id):
+        await event.reply(
+            "Готово, отписал от обычных уведомлений.\n\n"
+            "Weekly всё равно живёт отдельно и отправляется только в WEEKLY_TARGET_IDS.",
+            buttons=bot_menu_buttons(),
+        )
+    else:
+        await event.reply(
+            "Ты и так не был подписан на обычные уведомления.",
+            buttons=bot_menu_buttons(),
+        )
+
+
+@bot_client.on(events.NewMessage(pattern="(?i)^(ℹ️ Help|Help|Помощь)$"))
+async def help_button_handler(event):
+    await help_handler(event)
+
+
+@bot_client.on(events.NewMessage(pattern="(?i)^(🚫 Отписаться|Отписаться)$"))
+async def unsubscribe_button_handler(event):
+    await unsubscribe_handler(event)
 
 
 @bot_client.on(events.NewMessage(pattern="/subscribers"))
@@ -290,18 +374,7 @@ async def new_post_handler(event):
     if TARGET_TAG.lower() not in full_text.lower():
         return
 
-    channel_name = getattr(chat, "title", "Unknown channel")
-    username = getattr(chat, "username", None)
-
-    if username:
-        link = f"https://t.me/{username}/{message.id}"
-    else:
-        link = "Приватный канал — публичной ссылки нет"
-
-    text_for_message = full_text.strip() or "Новый пост без текста"
-    text_for_message = shorten_text(text_for_message, MAX_TEXT_LENGTH)
-
-    post_text = f"🎨 Найден арт из: {channel_name}\n\n{text_for_message}\n\n🔗 {link}"
+    channel_name, username, link, post_text = build_post_data(chat, message, full_text)
 
     # Сохраняем в недельную сводку
     save_weekly_post({
@@ -312,7 +385,6 @@ async def new_post_handler(event):
         "date": datetime.now(BAKU_TIMEZONE).isoformat(),
     })
 
-    # Сразу отправляем всем подписчикам
     subscribers = load_subscribers()
 
     if not subscribers:
