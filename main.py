@@ -35,7 +35,6 @@ CHANNELS = [
     "tosamoeshtobbulo",
     "clancy0001",
     "vval_jpg",
-    "artstlv",
     "trench_camp",
     "cyg_speaks",
     "mafchhh",
