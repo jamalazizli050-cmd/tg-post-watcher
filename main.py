@@ -162,20 +162,45 @@ def build_post_data(chat, message, full_text):
     return channel_name, username, link, post_text
 
 
+def build_weekly_post(chat, messages, full_text):
+    first_message = messages[0]
+    channel_name, username, link, post_text = build_post_data(chat, first_message, full_text)
+
+    return {
+        "channel_name": channel_name,
+        "username": username,
+        "text": full_text.strip() or "Новый пост без текста",
+        "link": link,
+        "date": datetime.now(BAKU_TIMEZONE).isoformat(),
+        "media_ids": [message.id for message in messages if message.media],
+    }, post_text
+
+
 def bot_menu_buttons():
     return [
-        [Button.text("ℹ️ Help"), Button.text("🚫 Отписаться")],
+        [
+            Button.inline("Help", b"help"),
+            Button.inline("Weekly", b"weekly"),
+        ],
+        [Button.inline("Отписаться", b"unsubscribe")],
     ]
 
 
 def help_text():
     return (
         "🎨 #cliqueart watcher\n\n"
-        "Я присылаю новые посты с #cliqueart из отслеживаемых каналов.\n\n"
+        "Я присылаю новые посты с #cliqueart из отслеживаемых каналов.\n"
         "/start — подписаться на обычные уведомления\n"
         "/unsubscribe — отписаться от обычных уведомлений\n"
-        "/help — показать эту подсказку\n\n"
-        "Еженедельная сводка отправляется только в чаты из WEEKLY_TARGET_IDS в .env."
+        "/weekly — прислать текущую weekly-подборку без очистки кеша"
+    )
+
+
+async def clear_old_keyboard(chat_id):
+    await bot_client.send_message(
+        chat_id,
+        "Убрал старую клавиатуру.",
+        buttons=Button.clear(),
     )
 
 
@@ -225,7 +250,7 @@ async def notify_subscribers(subscribers, post_text, media_messages):
             print(f"Не смог отправить пользователю {user_id}: {error}")
 
 
-def build_weekly_summary(posts):
+def build_weekly_header(posts):
     if not posts:
         return (
             "🎨 Weekly #cliqueart\n"
@@ -233,29 +258,73 @@ def build_weekly_summary(posts):
             "За неделю было пусто."
         )
 
-    lines = [
-        "🎨 Weekly #cliqueart",
-        "━━━━━━━━━━━━",
-        "",
-        f"Постов за неделю: {len(posts)}",
-        "",
-    ]
-
-    for index, post in enumerate(posts, start=1):
-        text = post.get("text", "Без текста")
-        text = shorten_text(text, 180)
-
-        lines.append(f"{index}. 🎨 {post.get('channel_name', 'Unknown channel')}")
-        lines.append(text)
-        lines.append(f"🔗 {post.get('link', 'Ссылки нет')}")
-        lines.append("")
-
-    return "\n".join(lines)
+    return (
+        "🎨 Weekly #cliqueart\n"
+        "━━━━━━━━━━━━\n\n"
+        f"Постов за неделю: {len(posts)}"
+    )
 
 
-async def send_weekly_summary():
+def build_weekly_post_text(post, index):
+    text = post.get("text", "Без текста")
+    text = shorten_text(text, 700)
+
+    return (
+        f"{index}. 🎨 {post.get('channel_name', 'Unknown channel')}\n"
+        f"━━━━━━━━━━━━\n\n"
+        f"{text}\n\n"
+        f"🔗 {post.get('link', 'Ссылки нет')}"
+    )
+
+
+async def get_weekly_media_paths(post, temp_dir):
+    username = post.get("username")
+    media_ids = post.get("media_ids") or []
+    media_paths = []
+
+    if not username or not media_ids:
+        return media_paths
+
+    try:
+        messages = await user_client.get_messages(username, ids=media_ids)
+    except Exception as error:
+        print(f"Не смог получить weekly-медиа из {username}: {error}")
+        return media_paths
+
+    if not isinstance(messages, list):
+        messages = [messages]
+
+    for message in messages:
+        if not message or not message.media:
+            continue
+
+        try:
+            media_path = await user_client.download_media(message, file=temp_dir)
+        except Exception as error:
+            print(f"Не смог скачать weekly-медиа из {username}: {error}")
+            continue
+
+        if media_path:
+            media_paths.append(media_path)
+
+    return media_paths
+
+
+async def send_weekly_posts(target_id, posts):
+    await bot_client.send_message(target_id, build_weekly_header(posts))
+
+    if not posts:
+        return
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for index, post in enumerate(posts, start=1):
+            post_text = build_weekly_post_text(post, index)
+            media_paths = await get_weekly_media_paths(post, temp_dir)
+            await send_post_notification(target_id, post_text, media_paths)
+
+
+async def send_weekly_summary(clear_cache=True):
     posts = load_weekly_posts()
-    summary = build_weekly_summary(posts)
 
     if not WEEKLY_TARGET_IDS:
         print("WEEKLY_TARGET_IDS пустой. Некуда отправлять недельную сводку.")
@@ -263,12 +332,15 @@ async def send_weekly_summary():
 
     for target_id in WEEKLY_TARGET_IDS:
         try:
-            await bot_client.send_message(target_id, summary)
+            await send_weekly_posts(target_id, posts)
         except Exception as error:
             print(f"Не смог отправить weekly summary пользователю {target_id}: {error}")
 
-    clear_weekly_posts()
-    print("Еженедельная сводка отправлена и weekly_posts.json очищен.")
+    if clear_cache:
+        clear_weekly_posts()
+        print("Еженедельная сводка отправлена и weekly_posts.json очищен.")
+    else:
+        print("Еженедельная сводка отправлена без очистки weekly_posts.json.")
 
 
 @bot_client.on(events.NewMessage(pattern="/start"))
@@ -295,6 +367,12 @@ async def help_handler(event):
     await event.reply(help_text(), buttons=bot_menu_buttons())
 
 
+@bot_client.on(events.NewMessage(pattern="/weekly"))
+async def weekly_handler(event):
+    await event.reply("Ок, кидаю текущую weekly-подборку. Кеш не очищаю.")
+    await send_weekly_posts(event.sender_id, load_weekly_posts())
+
+
 @bot_client.on(events.NewMessage(pattern="/unsubscribe"))
 async def unsubscribe_handler(event):
     if remove_subscriber(event.sender_id):
@@ -310,13 +388,51 @@ async def unsubscribe_handler(event):
         )
 
 
-@bot_client.on(events.NewMessage(pattern="(?i)^(ℹ️ Help|Help|Помощь)$"))
+@bot_client.on(events.CallbackQuery(data=b"help"))
 async def help_button_handler(event):
+    await event.answer()
+    await event.respond(help_text(), buttons=bot_menu_buttons())
+
+
+@bot_client.on(events.CallbackQuery(data=b"weekly"))
+async def weekly_button_handler(event):
+    await event.answer("Кидаю weekly")
+    await event.respond("Ок, кидаю текущую weekly-подборку. Кеш не очищаю.")
+    await send_weekly_posts(event.sender_id, load_weekly_posts())
+
+
+@bot_client.on(events.CallbackQuery(data=b"unsubscribe"))
+async def unsubscribe_button_handler(event):
+    await event.answer()
+
+    if remove_subscriber(event.sender_id):
+        await event.respond(
+            "Готово, отписал от обычных уведомлений.\n\n"
+            "Weekly живёт отдельно и отправляется только в WEEKLY_TARGET_IDS.",
+            buttons=bot_menu_buttons(),
+        )
+    else:
+        await event.respond(
+            "Ты и так не был подписан на обычные уведомления.",
+            buttons=bot_menu_buttons(),
+        )
+
+
+@bot_client.on(events.NewMessage(pattern="(?i)^(ℹ️ Help|Help|Помощь)$"))
+async def old_help_button_handler(event):
+    await clear_old_keyboard(event.chat_id)
     await help_handler(event)
 
 
+@bot_client.on(events.NewMessage(pattern="(?i)^(Weekly|Викли|Неделя)$"))
+async def old_weekly_button_handler(event):
+    await clear_old_keyboard(event.chat_id)
+    await weekly_handler(event)
+
+
 @bot_client.on(events.NewMessage(pattern="(?i)^(🚫 Отписаться|Отписаться)$"))
-async def unsubscribe_button_handler(event):
+async def old_unsubscribe_button_handler(event):
+    await clear_old_keyboard(event.chat_id)
     await unsubscribe_handler(event)
 
 
@@ -341,15 +457,9 @@ async def new_album_handler(event):
     if TARGET_TAG.lower() not in full_text.lower():
         return
 
-    channel_name, username, link, post_text = build_post_data(chat, first_message, full_text)
+    weekly_post, post_text = build_weekly_post(chat, messages, full_text)
 
-    save_weekly_post({
-        "channel_name": channel_name,
-        "username": username,
-        "text": full_text.strip() or "Новый пост без текста",
-        "link": link,
-        "date": datetime.now(BAKU_TIMEZONE).isoformat(),
-    })
+    save_weekly_post(weekly_post)
 
     subscribers = load_subscribers()
 
@@ -374,16 +484,9 @@ async def new_post_handler(event):
     if TARGET_TAG.lower() not in full_text.lower():
         return
 
-    channel_name, username, link, post_text = build_post_data(chat, message, full_text)
+    weekly_post, post_text = build_weekly_post(chat, [message], full_text)
 
-    # Сохраняем в недельную сводку
-    save_weekly_post({
-        "channel_name": channel_name,
-        "username": username,
-        "text": full_text.strip() or "Новый пост без текста",
-        "link": link,
-        "date": datetime.now(BAKU_TIMEZONE).isoformat(),
-    })
+    save_weekly_post(weekly_post)
 
     subscribers = load_subscribers()
 
