@@ -1,5 +1,6 @@
 import os
 import json
+import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -113,6 +114,68 @@ def shorten_text(text, max_length):
     return text
 
 
+def build_post_data(chat, message, full_text):
+    channel_name = getattr(chat, "title", "Unknown channel")
+    username = getattr(chat, "username", None)
+
+    if username:
+        link = f"https://t.me/{username}/{message.id}"
+    else:
+        link = "Приватный канал — публичной ссылки нет"
+
+    text_for_message = full_text.strip() or "Новый пост без текста"
+    text_for_message = shorten_text(text_for_message, MAX_TEXT_LENGTH)
+    post_text = f"🎨 Найден арт из: {channel_name}\n\n{text_for_message}\n\n🔗 {link}"
+
+    return channel_name, username, link, post_text
+
+
+async def send_post_notification(user_id, post_text, media_paths):
+    if not media_paths:
+        await bot_client.send_message(user_id, post_text)
+        return
+
+    for start in range(0, len(media_paths), 10):
+        media_chunk = media_paths[start:start + 10]
+        caption = post_text if start == 0 else None
+        file_to_send = media_chunk[0] if len(media_chunk) == 1 else media_chunk
+        await bot_client.send_file(
+            user_id,
+            file_to_send,
+            caption=caption,
+            supports_streaming=True,
+        )
+
+
+async def notify_subscribers(subscribers, post_text, media_messages):
+    media_paths = []
+
+    if media_messages:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for media_message in media_messages:
+                try:
+                    media_path = await user_client.download_media(media_message, file=temp_dir)
+                except Exception as error:
+                    print(f"Не смог скачать медиа из поста: {error}")
+                    continue
+
+                if media_path:
+                    media_paths.append(media_path)
+
+            for user_id in subscribers:
+                try:
+                    await send_post_notification(user_id, post_text, media_paths)
+                except Exception as error:
+                    print(f"Не смог отправить пользователю {user_id}: {error}")
+        return
+
+    for user_id in subscribers:
+        try:
+            await send_post_notification(user_id, post_text, media_paths)
+        except Exception as error:
+            print(f"Не смог отправить пользователю {user_id}: {error}")
+
+
 def build_weekly_summary(posts):
     if not posts:
         return (
@@ -180,10 +243,48 @@ async def subscribers_handler(event):
     await event.reply(f"👥 Подписчиков: {len(subscribers)}")
 
 
+@user_client.on(events.Album(chats=CHANNELS))
+async def new_album_handler(event):
+    chat = await event.get_chat()
+    messages = event.messages
+    first_message = messages[0]
+
+    full_text = "\n".join(
+        (message.text or message.caption or "").strip()
+        for message in messages
+        if message.text or message.caption
+    )
+
+    if TARGET_TAG.lower() not in full_text.lower():
+        return
+
+    channel_name, username, link, post_text = build_post_data(chat, first_message, full_text)
+
+    save_weekly_post({
+        "channel_name": channel_name,
+        "username": username,
+        "text": full_text.strip() or "Новый пост без текста",
+        "link": link,
+        "date": datetime.now(BAKU_TIMEZONE).isoformat(),
+    })
+
+    subscribers = load_subscribers()
+
+    if not subscribers:
+        print("Пост найден и сохранён в weekly_posts.json, но подписчиков пока нет.")
+        return
+
+    media_messages = [message for message in messages if message.media]
+    await notify_subscribers(subscribers, post_text, media_messages)
+
+
 @user_client.on(events.NewMessage(chats=CHANNELS))
 async def new_post_handler(event):
     chat = await event.get_chat()
     message = event.message
+
+    if message.grouped_id:
+        return
 
     full_text = message.text or message.caption or ""
 
@@ -221,7 +322,16 @@ async def new_post_handler(event):
 
     for user_id in subscribers:
         try:
-            await bot_client.send_message(user_id, post_text)
+            if message.media:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    media_path = await user_client.download_media(message, file=temp_dir)
+                    await send_post_notification(
+                        user_id,
+                        post_text,
+                        [media_path] if media_path else [],
+                    )
+            else:
+                await send_post_notification(user_id, post_text, [])
         except Exception as error:
             print(f"Не смог отправить пользователю {user_id}: {error}")
 
