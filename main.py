@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -40,6 +41,7 @@ MAX_TEXT_LENGTH = 100
 
 SUBSCRIBERS_FILE = "subscribers.txt"
 WEEKLY_POSTS_FILE = "weekly_posts.json"
+POST_LINK_PATTERN = re.compile(r"https://t\.me/(?P<username>[^/\s]+)/(?P<message_id>\d+)")
 
 BAKU_TIMEZONE = ZoneInfo("Asia/Baku")
 
@@ -173,6 +175,7 @@ def build_weekly_post(chat, messages, full_text):
         "text": full_text.strip() or "Новый пост без текста",
         "link": link,
         "date": datetime.now(BAKU_TIMEZONE).isoformat(),
+        "message_ids": [message.id for message in messages],
         "media_ids": [message.id for message in messages if message.media],
     }, post_text
 
@@ -283,6 +286,14 @@ def chunk_items(items, chunk_size):
         yield items[start:start + chunk_size]
 
 
+def parse_post_link(link):
+    match = POST_LINK_PATTERN.search(link or "")
+    if not match:
+        return None, None
+
+    return match.group("username"), int(match.group("message_id"))
+
+
 def build_weekly_text(posts):
     lines = [build_weekly_header(posts)]
 
@@ -290,6 +301,26 @@ def build_weekly_text(posts):
         lines.extend([
             "",
             f"{index}. 🎨 {post.get('channel_name', 'Unknown channel')}",
+            shorten_text(post.get("text", "Без текста"), 180),
+            f"🔗 {post.get('link', 'Ссылки нет')}",
+        ])
+
+    return "\n".join(lines)
+
+
+def build_no_media_weekly_text(posts):
+    lines = [
+        "📝 Weekly без медиа",
+        "━━━━━━━━━━━━",
+        "",
+        f"Постов без медиа: {len(posts)}",
+    ]
+
+    for item in posts:
+        post = item["post"]
+        lines.extend([
+            "",
+            f"{item['index']}. 🎨 {post.get('channel_name', 'Unknown channel')}",
             shorten_text(post.get("text", "Без текста"), 180),
             f"🔗 {post.get('link', 'Ссылки нет')}",
         ])
@@ -319,11 +350,19 @@ def build_weekly_media_caption(posts, chunk, chunk_number, total_chunks):
 
 
 async def get_weekly_media_items(post, post_index, temp_dir):
-    chat_ref = post.get("username") or post.get("chat_id")
-    media_ids = post.get("media_ids") or []
+    link_username, link_message_id = parse_post_link(post.get("link"))
+    chat_ref = post.get("username") or link_username or post.get("chat_id")
+    media_ids = post.get("media_ids") or post.get("message_ids") or []
     media_items = []
 
+    if not media_ids and link_message_id:
+        media_ids = [link_message_id]
+
     if not chat_ref or not media_ids:
+        print(
+            "Нет данных для weekly-медиа: "
+            f"{post.get('channel_name', 'Unknown channel')} / {post.get('link', 'no link')}"
+        )
         return media_items
 
     try:
@@ -353,6 +392,12 @@ async def get_weekly_media_items(post, post_index, temp_dir):
                 "path": media_path,
             })
 
+    if not media_items:
+        print(
+            "Weekly-медиа не найдено в сообщениях: "
+            f"{post.get('channel_name', 'Unknown channel')} / ids={media_ids}"
+        )
+
     return media_items
 
 
@@ -365,9 +410,18 @@ async def send_weekly_posts(target_id, posts):
 
     with tempfile.TemporaryDirectory() as temp_dir:
         media_items = []
+        posts_without_media = []
 
         for index, post in enumerate(posts, start=1):
-            media_items.extend(await get_weekly_media_items(post, index, temp_dir))
+            post_media_items = await get_weekly_media_items(post, index, temp_dir)
+
+            if post_media_items:
+                media_items.extend(post_media_items)
+            else:
+                posts_without_media.append({
+                    "index": index,
+                    "post": post,
+                })
 
         if not media_items:
             await bot_client.send_message(target_id, build_weekly_text(posts))
@@ -383,6 +437,12 @@ async def send_weekly_posts(target_id, posts):
                 [item["path"] for item in chunk],
                 caption=caption,
                 supports_streaming=True,
+            )
+
+        if posts_without_media:
+            await bot_client.send_message(
+                target_id,
+                build_no_media_weekly_text(posts_without_media),
             )
 
 
