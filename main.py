@@ -168,6 +168,7 @@ def build_weekly_post(chat, messages, full_text):
 
     return {
         "channel_name": channel_name,
+        "chat_id": getattr(chat, "id", None),
         "username": username,
         "text": full_text.strip() or "Новый пост без текста",
         "link": link,
@@ -265,31 +266,71 @@ def build_weekly_header(posts):
     )
 
 
-def build_weekly_post_text(post, index):
-    text = post.get("text", "Без текста")
-    text = shorten_text(text, 700)
+def sort_weekly_posts(posts):
+    def date_key(post):
+        raw_date = post.get("date", "")
 
-    return (
-        f"{index}. 🎨 {post.get('channel_name', 'Unknown channel')}\n"
-        f"━━━━━━━━━━━━\n\n"
-        f"{text}\n\n"
-        f"🔗 {post.get('link', 'Ссылки нет')}"
-    )
+        try:
+            return datetime.fromisoformat(raw_date)
+        except (TypeError, ValueError):
+            return datetime.min.replace(tzinfo=BAKU_TIMEZONE)
+
+    return sorted(posts, key=date_key)
 
 
-async def get_weekly_media_paths(post, temp_dir):
-    username = post.get("username")
+def chunk_items(items, chunk_size):
+    for start in range(0, len(items), chunk_size):
+        yield items[start:start + chunk_size]
+
+
+def build_weekly_text(posts):
+    lines = [build_weekly_header(posts)]
+
+    for index, post in enumerate(posts, start=1):
+        lines.extend([
+            "",
+            f"{index}. 🎨 {post.get('channel_name', 'Unknown channel')}",
+            shorten_text(post.get("text", "Без текста"), 180),
+            f"🔗 {post.get('link', 'Ссылки нет')}",
+        ])
+
+    return "\n".join(lines)
+
+
+def build_weekly_media_caption(posts, chunk, chunk_number, total_chunks):
+    lines = [
+        build_weekly_header(posts),
+        "",
+        f"Медиа {chunk_number}/{total_chunks}",
+        "",
+    ]
+
+    for item in chunk:
+        lines.append(
+            f"{item['index']}. 🎨 {item['channel_name']}\n"
+            f"🔗 {item['link']}"
+        )
+
+    caption = "\n\n".join(lines)
+    if len(caption) > 1000:
+        caption = caption[:980].rstrip() + "\n\n...ещё ссылки в следующих постах"
+
+    return caption
+
+
+async def get_weekly_media_items(post, post_index, temp_dir):
+    chat_ref = post.get("username") or post.get("chat_id")
     media_ids = post.get("media_ids") or []
-    media_paths = []
+    media_items = []
 
-    if not username or not media_ids:
-        return media_paths
+    if not chat_ref or not media_ids:
+        return media_items
 
     try:
-        messages = await user_client.get_messages(username, ids=media_ids)
+        messages = await user_client.get_messages(chat_ref, ids=media_ids)
     except Exception as error:
-        print(f"Не смог получить weekly-медиа из {username}: {error}")
-        return media_paths
+        print(f"Не смог получить weekly-медиа из {chat_ref}: {error}")
+        return media_items
 
     if not isinstance(messages, list):
         messages = [messages]
@@ -301,26 +342,48 @@ async def get_weekly_media_paths(post, temp_dir):
         try:
             media_path = await user_client.download_media(message, file=temp_dir)
         except Exception as error:
-            print(f"Не смог скачать weekly-медиа из {username}: {error}")
+            print(f"Не смог скачать weekly-медиа из {chat_ref}: {error}")
             continue
 
         if media_path:
-            media_paths.append(media_path)
+            media_items.append({
+                "index": post_index,
+                "channel_name": post.get("channel_name", "Unknown channel"),
+                "link": post.get("link", "Ссылки нет"),
+                "path": media_path,
+            })
 
-    return media_paths
+    return media_items
 
 
 async def send_weekly_posts(target_id, posts):
-    await bot_client.send_message(target_id, build_weekly_header(posts))
+    posts = sort_weekly_posts(posts)
 
     if not posts:
+        await bot_client.send_message(target_id, build_weekly_header(posts))
         return
 
     with tempfile.TemporaryDirectory() as temp_dir:
+        media_items = []
+
         for index, post in enumerate(posts, start=1):
-            post_text = build_weekly_post_text(post, index)
-            media_paths = await get_weekly_media_paths(post, temp_dir)
-            await send_post_notification(target_id, post_text, media_paths)
+            media_items.extend(await get_weekly_media_items(post, index, temp_dir))
+
+        if not media_items:
+            await bot_client.send_message(target_id, build_weekly_text(posts))
+            return
+
+        chunks = list(chunk_items(media_items, 10))
+        total_chunks = len(chunks)
+
+        for chunk_number, chunk in enumerate(chunks, start=1):
+            caption = build_weekly_media_caption(posts, chunk, chunk_number, total_chunks)
+            await bot_client.send_file(
+                target_id,
+                [item["path"] for item in chunk],
+                caption=caption,
+                supports_streaming=True,
+            )
 
 
 async def send_weekly_summary(clear_cache=True):
